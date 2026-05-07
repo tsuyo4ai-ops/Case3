@@ -10,6 +10,10 @@ import os
 # ページのタイトル設定
 st.set_page_config(page_title="AI画像分類アプリ", layout="centered")
 
+# サイドバー設定
+st.sidebar.header("機能設定")
+enable_cat_crop = st.sidebar.checkbox("猫の自動切り抜きを有効にする", value=False, help="ONにすると物体検出モデルをロードし、猫を抽出します。")
+
 @st.cache_data
 def get_translation_map():
     """ImageNetのインデックスを日本語と英語名に変換する辞書をロード。失敗時は英語のみを返す。"""
@@ -45,13 +49,13 @@ def load_detection_model():
     model.eval()
     return model, weights.meta["categories"]
 
-def detect_and_crop_cat(img, det_model, categories):
+@torch.inference_mode()
+def detect_and_crop_cat(img, det_model, categories, threshold=0.8):
     """猫を検出し、最も確信度の高い個体をクロップする"""
     transform = transforms.Compose([transforms.ToTensor()])
     input_tensor = transform(img)
     
-    with torch.no_grad():
-        prediction = det_model([input_tensor])[0]
+    prediction = det_model([input_tensor])[0]
     
     # COCOデータセットで猫のラベルは 'cat'
     cat_label_idx = [i for i, cat in enumerate(categories) if cat == 'cat'][0]
@@ -59,7 +63,7 @@ def detect_and_crop_cat(img, det_model, categories):
     # スコアが高い順に猫を探す
     best_box = None
     for i, label in enumerate(prediction['labels']):
-        if label == cat_label_idx and prediction['scores'][i] > 0.8: # 閾値0.8
+        if label == cat_label_idx and prediction['scores'][i] > threshold:
             best_box = prediction['boxes'][i].tolist()
             break
     
@@ -77,6 +81,7 @@ def get_download_data(img, format="PNG"):
     save_img.save(buf, format=format)
     return buf.getvalue()
 
+@torch.inference_mode()
 def predict(img, model):
     """画像を受け取り、分類結果を返す"""
     # PyTorch用の前処理（リサイズ、テンソル化、正規化）
@@ -90,8 +95,7 @@ def predict(img, model):
     input_tensor = preprocess(img)
     input_batch = input_tensor.unsqueeze(0)  # バッチ次元の追加
 
-    with torch.no_grad():
-        output = model(input_batch)
+    output = model(input_batch)
     
     # ソフトマックス関数で確率に変換し、上位3つを取得
     probabilities = torch.nn.functional.softmax(output[0], dim=0)
@@ -110,7 +114,11 @@ if uploaded_files: # 複数のファイルがアップロードされた場合
     # モデルと翻訳マップは一度だけロード（@st.cache_resource/@st.cache_dataにより）
     model = load_model()
     class_index = get_translation_map()
-    det_model, categories = load_detection_model()
+    
+    # 猫検知が有効な場合のみ物体検出モデルをロード
+    det_model, categories = None, None
+    if enable_cat_crop:
+        det_model, categories = load_detection_model()
     
     # 2列のグリッドレイアウトを作成して垂直方向のスクロールを削減
     cols = st.columns(2)
@@ -136,7 +144,7 @@ if uploaded_files: # 複数のファイルがアップロードされた場合
                 # 猫が含まれているか判定（ImageNetの猫関連ID: 281-285）
                 is_cat = any(281 <= idx <= 285 for idx in indices)
                 
-                if is_cat:
+                if is_cat and enable_cat_crop:
                     st.success("🐱 猫を検知しました！切り抜きを作成します。")
                     cropped_cat = detect_and_crop_cat(img, det_model, categories)
                     if cropped_cat:
