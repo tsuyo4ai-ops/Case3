@@ -10,19 +10,27 @@ st.set_page_config(page_title="AI画像分類アプリ", layout="centered")
 
 @st.cache_data
 def get_translation_map():
-    """ImageNetのインデックスを日本語と英語名に変換する辞書をロード"""
+    """ImageNetのインデックスを日本語と英語名に変換する辞書をロード。失敗時は英語のみを返す。"""
+    # torchvisionのモデルメタデータから標準の英語ラベルを取得
+    weights = models.MobileNet_V2_Weights.DEFAULT
+    en_labels = weights.meta["categories"]
+    
     url = "https://raw.githubusercontent.com/kazunori279/imagenet-japanese/master/imagenet_class_index.json"
     try:
-        response = requests.get(url, timeout=5)
-        return response.json()
+        response = requests.get(url, timeout=3)
+        response.raise_for_status() # HTTPエラーが発生した場合に例外を発生させる
+        jp_data = response.json()
+        # インデックスをキーに、英語と日本語のペアを辞書化
+        return {k: {"en": en_labels[int(k)], "jp": v[2]} for k, v in jp_data.items()}
     except Exception:
-        return {}
+        # 日本語データの取得に失敗した場合は、日本語をNoneとして英語ラベルのみを返す
+        return {str(i): {"en": label, "jp": None} for i, label in enumerate(en_labels)}
 
 @st.cache_resource
 def load_model():
     """学習済みモデルをロード（キャッシュして高速化）"""
     # MobileNetV2の学習済み重みをロード
-    model = models.mobilenet_v2(weights=models.MobileNetV2_Weights.DEFAULT)
+    model = models.mobilenet_v2(weights="DEFAULT")
     model.eval()  # 推論モードに設定
     return model
 
@@ -70,10 +78,13 @@ if uploaded_file is not None:
         idx = str(indices[i])
         prob = probs[i]
         
-        # 辞書からラベルを取得（[ID, English, Japanese] の形式）
-        labels = class_index.get(idx, ["unknown", "unknown", "不明"])
-        label_en = labels[1].replace('_', ' ')
-        label_jp = labels[2]
+        # 辞書からラベルデータを取得
+        label_data = class_index.get(idx, {"en": "unknown", "jp": None})
+        label_en = label_data["en"].replace('_', ' ')
+        label_jp = label_data["jp"]
         
-        st.write(f"**{i+1}. {label_jp} / {label_en}** ({prob*100:.2f}%)")
+        if label_jp:
+            st.write(f"**{i+1}. {label_jp} / {label_en}** ({prob*100:.2f}%)")
+        else:
+            st.write(f"**{i+1}. {label_en}** ({prob*100:.2f}%)")
         st.progress(prob)
