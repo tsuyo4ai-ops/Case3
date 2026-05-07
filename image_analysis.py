@@ -4,6 +4,8 @@ from torchvision import models, transforms
 import numpy as np
 from PIL import Image
 import requests
+import io
+import os
 
 # ページのタイトル設定
 st.set_page_config(page_title="AI画像分類アプリ", layout="centered")
@@ -34,6 +36,47 @@ def load_model():
     model.eval()  # 推論モードに設定
     return model
 
+@st.cache_resource
+def load_detection_model():
+    """物体検出モデル（Faster R-CNN）をロード"""
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+    weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+    model = fasterrcnn_resnet50_fpn_v2(weights=weights)
+    model.eval()
+    return model, weights.meta["categories"]
+
+def detect_and_crop_cat(img, det_model, categories):
+    """猫を検出し、最も確信度の高い個体をクロップする"""
+    transform = transforms.Compose([transforms.ToTensor()])
+    input_tensor = transform(img)
+    
+    with torch.no_grad():
+        prediction = det_model([input_tensor])[0]
+    
+    # COCOデータセットで猫のラベルは 'cat'
+    cat_label_idx = [i for i, cat in enumerate(categories) if cat == 'cat'][0]
+    
+    # スコアが高い順に猫を探す
+    best_box = None
+    for i, label in enumerate(prediction['labels']):
+        if label == cat_label_idx and prediction['scores'][i] > 0.8: # 閾値0.8
+            best_box = prediction['boxes'][i].tolist()
+            break
+    
+    if best_box:
+        # クロップ実行 [xmin, ymin, xmax, ymax]
+        cropped_img = img.crop((best_box[0], best_box[1], best_box[2], best_box[3]))
+        return cropped_img
+    return None
+
+def get_download_data(img, format="PNG"):
+    """画像をバイトデータに変換"""
+    buf = io.BytesIO()
+    # RGBAならRGBに変換して保存（JPEG対応等のため）
+    save_img = img.convert("RGB") if img.mode == "RGBA" else img
+    save_img.save(buf, format=format)
+    return buf.getvalue()
+
 def predict(img, model):
     """画像を受け取り、分類結果を返す"""
     # PyTorch用の前処理（リサイズ、テンソル化、正規化）
@@ -60,31 +103,60 @@ def predict(img, model):
 st.title("🖼️ 画像オブジェクト分類アプリ")
 st.write("画像をアップロードすると、AIが何が写っているかを解析します。")
 
-uploaded_file = st.file_uploader("画像ファイルを選択してください...", type=["jpg", "jpeg", "png"])
+# 複数ファイルのアップロードを許可
+uploaded_files = st.file_uploader("画像ファイルを選択してください...", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
-if uploaded_file is not None:
-    # 画像の表示
-    img = Image.open(uploaded_file)
-    st.image(img, caption="アップロードされた画像", use_container_width=True)
+if uploaded_files: # 複数のファイルがアップロードされた場合
+    # モデルと翻訳マップは一度だけロード（@st.cache_resource/@st.cache_dataにより）
+    model = load_model()
+    class_index = get_translation_map()
+    det_model, categories = load_detection_model()
     
-    with st.spinner('解析中...'):
-        # モデルのロードと予測
-        model = load_model()
-        class_index = get_translation_map()
-        probs, indices = predict(img, model)
-        
-    st.subheader("解析結果:")
-    for i in range(len(indices)):
-        idx = str(indices[i])
-        prob = probs[i]
-        
-        # 辞書からラベルデータを取得
-        label_data = class_index.get(idx, {"en": "unknown", "jp": None})
-        label_en = label_data["en"].replace('_', ' ')
-        label_jp = label_data["jp"]
-        
-        if label_jp:
-            st.write(f"**{i+1}. {label_jp} / {label_en}** ({prob*100:.2f}%)")
-        else:
-            st.write(f"**{i+1}. {label_en}** ({prob*100:.2f}%)")
-        st.progress(prob)
+    # 2列のグリッドレイアウトを作成して垂直方向のスクロールを削減
+    cols = st.columns(2)
+    
+    for i, uploaded_file in enumerate(uploaded_files):
+        # インデックスに応じて左右のカラムに振り分け
+        with cols[i % 2]:
+            with st.container(border=True):
+                # 画像の読み込み
+                img = Image.open(uploaded_file)
+                
+                # 小さなプレビュー画像を表示
+                st.image(img, use_container_width=True)
+                # クリックして拡大表示するためのポップオーバー
+                with st.popover("🔍 画像を拡大して確認"):
+                    st.image(img, caption=uploaded_file.name, use_container_width=True)
+                
+                st.write(f"**{uploaded_file.name}**")
+                
+                with st.spinner('解析中...'):
+                    probs, indices = predict(img, model)
+                
+                # 猫が含まれているか判定（ImageNetの猫関連ID: 281-285）
+                is_cat = any(281 <= idx <= 285 for idx in indices)
+                
+                if is_cat:
+                    st.success("🐱 猫を検知しました！切り抜きを作成します。")
+                    cropped_cat = detect_and_crop_cat(img, det_model, categories)
+                    if cropped_cat:
+                        st.image(cropped_cat, caption="切り抜かれた猫", width=150)
+                        
+                        # ファイル名の生成
+                        base_name, ext = os.path.splitext(uploaded_file.name)
+                        cat_file_name = f"{base_name}_CAT{ext}"
+                        
+                        # ダウンロードボタン
+                        btn_data = get_download_data(cropped_cat, format="PNG" if ext.lower()==".png" else "JPEG")
+                        st.download_button(label="💾 クロップ画像を保存", data=btn_data, file_name=cat_file_name, mime=f"image/{ext[1:]}")
+
+                for j in range(len(indices)):
+                    idx = str(indices[j])
+                    prob = probs[j]
+                    label_data = class_index.get(idx, {"en": "unknown", "jp": None})
+                    label_en = label_data["en"].replace('_', ' ')
+                    label_jp = label_data["jp"]
+                    
+                    display_name = f"{label_jp} / {label_en}" if label_jp else label_en
+                    st.write(f"{j+1}. {display_name} ({prob*100:.1f}%)")
+                    st.progress(prob)

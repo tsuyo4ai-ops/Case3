@@ -4,3 +4,4 @@ torchvision>=0.15.0
 pillow
 numpy
 requests
+os-sys
